@@ -1,0 +1,369 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Enums ────────────────────────────────────────────────────────────────────
+
+enum TaskState {
+  CREATED
+  PLANNING
+  AWAITING_APPROVAL
+  CODING
+  REVIEWING
+  COMMITTING
+  BUILDING
+  DEPLOYING
+  COMPLETED
+  PAUSED
+  CANCELLED
+  FAILED
+  TIMED_OUT
+}
+
+enum TaskEvent {
+  analyze_request
+  plan_ready
+  user_approved
+  user_rejected
+  code_ready
+  review_passed
+  review_failed
+  commit_success
+  commit_fail
+  build_success
+  build_fail
+  deploy_success
+  deploy_fail
+  user_pause
+  user_resume
+  user_cancel
+  timeout
+}
+
+enum ProjectFramework {
+  react
+  nextjs
+  nodejs
+}
+
+enum MessageRole {
+  user
+  assistant
+  system
+}
+
+enum BuildStatus {
+  pending
+  running
+  success
+  failure
+}
+
+enum DeploymentStatus {
+  pending
+  building
+  ready
+  error
+  cancelled
+}
+
+enum DeploymentEnvironment {
+  preview
+  production
+}
+
+enum AgentName {
+  orchestrator
+  planner
+  coder
+  reviewer
+  debugger
+}
+
+enum AgentLogLevel {
+  info
+  warn
+  error
+  debug
+}
+
+// ─── Users ────────────────────────────────────────────────────────────────────
+
+model User {
+  id              String   @id @default(cuid())
+  email           String   @unique
+  name            String?
+  avatarUrl       String?
+  githubId        String   @unique
+  githubUsername  String   @unique
+  githubToken     String?  // encrypted — never expose to LLM
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  projects        Project[]
+  conversations   Conversation[]
+  preferences     UserPreference?
+
+  @@map("users")
+}
+
+model UserPreference {
+  id                 String           @id @default(cuid())
+  userId             String           @unique
+  defaultFramework   ProjectFramework @default(nextjs)
+  autoDeployPreview  Boolean          @default(true)
+  requireDeployApproval Boolean       @default(true)
+  maxRetriesOverride Int?             // null = use system default (3)
+  createdAt          DateTime         @default(now())
+  updatedAt          DateTime         @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_preferences")
+}
+
+// ─── Projects ─────────────────────────────────────────────────────────────────
+
+model Project {
+  id          String           @id @default(cuid())
+  userId      String
+  name        String
+  description String?
+  framework   ProjectFramework @default(nextjs)
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  repository    Repository?
+  conversations Conversation[]
+  tasks         Task[]
+
+  @@map("projects")
+}
+
+model Repository {
+  id            String   @id @default(cuid())
+  projectId     String   @unique
+  owner         String
+  name          String
+  fullName      String   @unique
+  defaultBranch String   @default("main")
+  url           String
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  project    Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  builds     Build[]
+  deployments Deployment[]
+
+  @@map("repositories")
+}
+
+// ─── Conversations & Messages ─────────────────────────────────────────────────
+
+model Conversation {
+  id        String   @id @default(cuid())
+  projectId String
+  userId    String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  project  Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages Message[]
+  tasks    Task[]
+
+  @@map("conversations")
+}
+
+model Message {
+  id             String      @id @default(cuid())
+  conversationId String
+  role           MessageRole
+  content        String
+  createdAt      DateTime    @default(now())
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@map("messages")
+}
+
+// ─── Tasks & State Machine ────────────────────────────────────────────────────
+
+model Task {
+  id             String     @id @default(cuid())
+  projectId      String
+  conversationId String
+  instruction    String
+  plan           Json?      // TaskPlan JSON
+  state          TaskState  @default(CREATED)
+  prevState      TaskState?
+  retryCount     Int        @default(0)
+  maxRetries     Int        @default(3)
+  fixHistory     Json       @default("[]") // FixAttempt[]
+  tokenUsed      Int        @default(0)
+  costUsd        Decimal    @default(0) @db.Decimal(10, 6)
+  startedAt      DateTime?
+  pausedAt       DateTime?
+  completedAt    DateTime?
+  timeoutAt      DateTime?
+  errorMessage   String?
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  project      Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  stateTransitions TaskStateTransition[]
+  taskSteps        TaskStep[]
+  builds           Build[]
+  deployments      Deployment[]
+  agentLogs        AgentLog[]
+  costRecords      CostRecord[]
+  fileSnapshots    FileSnapshot[]
+  agentContexts    AgentContext[]
+
+  @@map("tasks")
+}
+
+// Every state transition logged — source of truth for observability
+model TaskStateTransition {
+  id        String     @id @default(cuid())
+  taskId    String
+  fromState TaskState?
+  toState   TaskState
+  event     TaskEvent
+  metadata  Json?
+  createdAt DateTime   @default(now())
+
+  task Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId])
+  @@map("task_state_transitions")
+}
+
+model TaskStep {
+  id          String   @id @default(cuid())
+  taskId      String
+  index       Int
+  description String
+  status      String   @default("pending")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  task Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@map("task_steps")
+}
+
+// ─── File Snapshots (for rollback) ───────────────────────────────────────────
+
+model FileSnapshot {
+  id          String   @id @default(cuid())
+  taskId      String
+  path        String
+  contentBefore String? // null if file did not exist before
+  createdAt   DateTime @default(now())
+
+  task Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId])
+  @@map("file_snapshots")
+}
+
+// ─── Agent Context (LLM context persistence) ──────────────────────────────────
+
+model AgentContext {
+  id         String    @id @default(cuid())
+  taskId     String
+  agent      AgentName
+  contextJson Json     // serialized LLM message history
+  tokenCount  Int      @default(0)
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  task Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@unique([taskId, agent])
+  @@map("agent_contexts")
+}
+
+// ─── Builds & Deployments ─────────────────────────────────────────────────────
+
+model Build {
+  id           String      @id @default(cuid())
+  taskId       String
+  repositoryId String
+  commitSha    String
+  status       BuildStatus @default(pending)
+  logsUrl      String?
+  errorSummary String?
+  durationMs   Int?
+  startedAt    DateTime?
+  completedAt  DateTime?
+  createdAt    DateTime    @default(now())
+
+  task        Task        @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  repository  Repository  @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+  deployments Deployment[]
+
+  @@map("builds")
+}
+
+model Deployment {
+  id                  String                @id @default(cuid())
+  taskId              String
+  buildId             String
+  repositoryId        String
+  environment         DeploymentEnvironment
+  status              DeploymentStatus      @default(pending)
+  previewUrl          String?
+  productionUrl       String?
+  vercelDeploymentId  String?
+  createdAt           DateTime              @default(now())
+  updatedAt           DateTime              @updatedAt
+
+  task       Task       @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  build      Build      @relation(fields: [buildId], references: [id], onDelete: Cascade)
+  repository Repository @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+
+  @@map("deployments")
+}
+
+// ─── Agent Logs & Cost Tracking ───────────────────────────────────────────────
+
+model AgentLog {
+  id        String        @id @default(cuid())
+  taskId    String
+  agent     AgentName
+  level     AgentLogLevel @default(info)
+  message   String
+  metadata  Json?
+  createdAt DateTime      @default(now())
+
+  task Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId, createdAt])
+  @@map("agent_logs")
+}
+
+model CostRecord {
+  id           String    @id @default(cuid())
+  taskId       String
+  agent        AgentName
+  model        String
+  inputTokens  Int
+  outputTokens Int
+  costUsd      Decimal   @db.Decimal(10, 6)
+  createdAt    DateTime  @default(now())
+
+  task Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId])
+  @@map("cost_records")
+}

@@ -1,0 +1,6 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": "npm run db:generate && turbo run build --filter=@eyza/web",
+  "outputDirectory": "apps/web/.next",
+  "installCommand": "npm install"
+}
